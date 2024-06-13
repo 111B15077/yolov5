@@ -58,15 +58,15 @@ from utils.general import (
 from utils.loggers import GenericLogger
 from utils.plots import imshow_cls
 from utils.torch_utils import (
-    ModelEMA,
-    de_parallel,
-    model_info,
-    reshape_classifier_output,
-    select_device,
-    smart_DDP,
-    smart_optimizer,
-    smartCrossEntropyLoss,
-    torch_distributed_zero_first,
+    ModelEMA, #模型EMA（指數移動平均）
+    de_parallel, #去並行化
+    model_info, #模型信息
+    reshape_classifier_output, #重塑分類器輸出
+    select_device, #選擇設備
+    smart_DDP, #智能DDP（分布式數據並行）
+    smart_optimizer, #智能優化器
+    smartCrossEntropyLoss, #智能交叉熵損失
+    torch_distributed_zero_first, #分布式訓練的零優先
 )
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
