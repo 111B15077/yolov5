@@ -203,107 +203,104 @@ def train(opt, device):
         f'Starting {opt.model} training on {data} dataset with {nc} classes for {epochs} epochs...\n\n'
         f"{'Epoch':>10}{'GPU_mem':>10}{'train_loss':>12}{f'{val}_loss':>12}{'top1_acc':>12}{'top5_acc':>12}"
     )
-    for epoch in range(epochs):  # loop over the dataset multiple times
-        tloss, vloss, fitness = 0.0, 0.0, 0.0  # train loss, val loss, fitness
-        model.train()
-        if RANK != -1:
-            trainloader.sampler.set_epoch(epoch)
-        pbar = enumerate(trainloader)
+    for epoch in range(epochs):  # 多次遍歷數據集
+    tloss, vloss, fitness = 0.0, 0.0, 0.0  # 訓練損失、驗證損失、適應度
+    model.train()
+    if RANK != -1:
+        trainloader.sampler.set_epoch(epoch)
+    pbar = enumerate(trainloader)
+    if RANK in {-1, 0}:
+        pbar = tqdm(enumerate(trainloader), total=len(trainloader), bar_format=TQDM_BAR_FORMAT)
+    for i, (images, labels) in pbar:  # 進度條
+        images, labels = images.to(device, non_blocking=True), labels.to(device)
+
+        # 前向傳播
+        with amp.autocast(enabled=cuda):
+            loss = criterion(model(images), labels)
+
+        # 反向傳播
+        scaler.scale(loss).backward()
+
+        # 優化
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # 梯度裁剪
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        if ema:
+            ema.update(model)
+
         if RANK in {-1, 0}:
-            pbar = tqdm(enumerate(trainloader), total=len(trainloader), bar_format=TQDM_BAR_FORMAT)
-        for i, (images, labels) in pbar:  # progress bar
-            images, labels = images.to(device, non_blocking=True), labels.to(device)
+            # 打印
+            tloss = (tloss * i + loss.item()) / (i + 1)  # 更新平均損失
+            mem = "%.3gG" % (torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0)  # 記憶體使用量
+            pbar.desc = f"{f'{epoch + 1}/{epochs}':>10}{mem:>10}{tloss:>12.3g}" + " " * 36
 
-            # Forward
-            with amp.autocast(enabled=cuda):  # stability issues when enabled
-                loss = criterion(model(images), labels)
+            # 驗證
+            if i == len(pbar) - 1:
+                top1, top5, vloss = validate.run(
+                    model=ema.ema, dataloader=testloader, criterion=criterion, pbar=pbar
+                )
+                fitness = top1  # 定義適應度為 top1 準確率
 
-            # Backward
-            scaler.scale(loss).backward()
+    # 調度器
+    scheduler.step()
 
-            # Optimize
-            scaler.unscale_(optimizer)  # unscale gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            if ema:
-                ema.update(model)
+    # 記錄度量
+    if RANK in {-1, 0}:
+        if fitness > best_fitness:
+            best_fitness = fitness
 
-            if RANK in {-1, 0}:
-                # Print
-                tloss = (tloss * i + loss.item()) / (i + 1)  # update mean losses
-                mem = "%.3gG" % (torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0)  # (GB)
-                pbar.desc = f"{f'{epoch + 1}/{epochs}':>10}{mem:>10}{tloss:>12.3g}" + " " * 36
+        # 記錄
+        metrics = {
+            "train/loss": tloss,
+            f"{val}/loss": vloss,
+            "metrics/accuracy_top1": top1,
+            "metrics/accuracy_top5": top5,
+            "lr/0": optimizer.param_groups[0]["lr"],
+        }
+        logger.log_metrics(metrics, epoch)
 
-                # Test
-                if i == len(pbar) - 1:  # last batch
-                    top1, top5, vloss = validate.run(
-                        model=ema.ema, dataloader=testloader, criterion=criterion, pbar=pbar
-                    )  # test accuracy, loss
-                    fitness = top1  # define fitness as top1 accuracy
+        # 保存模型
+        final_epoch = epoch + 1 == epochs
+        if (not opt.nosave) or final_epoch:
+            ckpt = {
+                "epoch": epoch,
+                "best_fitness": best_fitness,
+                "model": deepcopy(ema.ema).half(),
+                "ema": None,
+                "updates": ema.updates,
+                "optimizer": None,
+                "opt": vars(opt),
+                "git": GIT_INFO,
+                "date": datetime.now().isoformat(),
+            }
+            torch.save(ckpt, last)
+            if best_fitness == fitness:
+                torch.save(ckpt, best)
+            del ckpt
 
-        # Scheduler
-        scheduler.step()
+# 訓練完成
+if RANK in {-1, 0} and final_epoch:
+    LOGGER.info(
+        f'\nTraining complete ({(time.time() - t0) / 3600:.3f} hours)'
+        f"\nResults saved to {colorstr('bold', save_dir)}"
+        f'\nPredict:         python classify/predict.py --weights {best} --source im.jpg'
+        f'\nValidate:        python classify/val.py --weights {best} --data {data_dir}'
+        f'\nExport:          python export.py --weights {best} --include onnx'
+        f"\nPyTorch Hub:     model = torch.hub.load('ultralytics/yolov5', 'custom', '{best}')"
+        f'\nVisualize:       https://netron.app\n'
+    )
 
-        # Log metrics
-        if RANK in {-1, 0}:
-            # Best fitness
-            if fitness > best_fitness:
-                best_fitness = fitness
+    # 繪製範例
+    images, labels = (x[:25] for x in next(iter(testloader)))
+    pred = torch.max(ema.ema(images.to(device)), 1)[1]
+    file = imshow_cls(images, labels, pred, de_parallel(model).names, verbose=False, f=save_dir / "test_images.jpg")
 
-            # Log
-            metrics = {
-                "train/loss": tloss,
-                f"{val}/loss": vloss,
-                "metrics/accuracy_top1": top1,
-                "metrics/accuracy_top5": top5,
-                "lr/0": optimizer.param_groups[0]["lr"],
-            }  # learning rate
-            logger.log_metrics(metrics, epoch)
-
-            # Save model
-            final_epoch = epoch + 1 == epochs
-            if (not opt.nosave) or final_epoch:
-                ckpt = {
-                    "epoch": epoch,
-                    "best_fitness": best_fitness,
-                    "model": deepcopy(ema.ema).half(),  # deepcopy(de_parallel(model)).half(),
-                    "ema": None,  # deepcopy(ema.ema).half(),
-                    "updates": ema.updates,
-                    "optimizer": None,  # optimizer.state_dict(),
-                    "opt": vars(opt),
-                    "git": GIT_INFO,  # {remote, branch, commit} if a git repo
-                    "date": datetime.now().isoformat(),
-                }
-
-                # Save last, best and delete
-                torch.save(ckpt, last)
-                if best_fitness == fitness:
-                    torch.save(ckpt, best)
-                del ckpt
-
-    # Train complete
-    if RANK in {-1, 0} and final_epoch:
-        LOGGER.info(
-            f'\nTraining complete ({(time.time() - t0) / 3600:.3f} hours)'
-            f"\nResults saved to {colorstr('bold', save_dir)}"
-            f'\nPredict:         python classify/predict.py --weights {best} --source im.jpg'
-            f'\nValidate:        python classify/val.py --weights {best} --data {data_dir}'
-            f'\nExport:          python export.py --weights {best} --include onnx'
-            f"\nPyTorch Hub:     model = torch.hub.load('ultralytics/yolov5', 'custom', '{best}')"
-            f'\nVisualize:       https://netron.app\n'
-        )
-
-        # Plot examples
-        images, labels = (x[:25] for x in next(iter(testloader)))  # first 25 images and labels
-        pred = torch.max(ema.ema(images.to(device)), 1)[1]
-        file = imshow_cls(images, labels, pred, de_parallel(model).names, verbose=False, f=save_dir / "test_images.jpg")
-
-        # Log results
-        meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}
-        logger.log_images(file, name="Test Examples (true-predicted)", epoch=epoch)
-        logger.log_model(best, epochs, metadata=meta)
+    # 記錄結果
+    meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}
+    logger.log_images(file, name="Test Examples (true-predicted)", epoch=epoch)
+    logger.log_model(best, epochs, metadata=meta)
 
 
 def parse_opt(known=False):
